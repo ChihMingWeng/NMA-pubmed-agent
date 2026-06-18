@@ -13,6 +13,8 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from io import BytesIO
+from math import erf, exp, sqrt
 from typing import Any, Iterable
 from urllib.parse import quote_plus
 
@@ -20,6 +22,12 @@ from urllib.parse import quote_plus
 NCBI_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 PUBMED_ARTICLE_URL = "https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
 DEFAULT_TOOL = "nma-pubmed-agent"
+DEFAULT_TOPIC = {
+    "condition": "rheumatoid arthritis",
+    "interventions": "adalimumab\netanercept\ninfliximab",
+    "comparators": "placebo\nmethotrexate",
+    "outcome": "ACR20 response",
+}
 
 RCT_FILTER = '((randomized controlled trial[Publication Type]) OR randomized[Title/Abstract] OR randomised[Title/Abstract] OR trial[Title/Abstract])'
 NMA_FILTER = '((network meta-analysis[Title/Abstract]) OR mixed treatment comparison[Title/Abstract] OR indirect treatment comparison[Title/Abstract])'
@@ -242,6 +250,175 @@ def build_evidence_network(edge_rows: Any) -> Any:
         weight = graph[a][b]["weight"] + 1 if graph.has_edge(a, b) else 1
         graph.add_edge(a, b, weight=weight)
     return graph
+
+
+def demo_extracted_comparisons() -> Any:
+    """Return example extracted contrast data for the built-in rheumatoid arthritis topic.
+
+    The rows are synthetic demonstration effect estimates intended to make the
+    web app runnable before users finish full-text data extraction. Users should
+    replace them with verified study-level contrasts before drawing conclusions.
+    """
+
+    import pandas as pd
+
+    return pd.DataFrame(
+        [
+            {"study_id": "DEMO-RA-01", "treatment_a": "adalimumab", "treatment_b": "placebo", "effect": 1.39, "se": 0.23, "pmid": ""},
+            {"study_id": "DEMO-RA-02", "treatment_a": "etanercept", "treatment_b": "placebo", "effect": 1.24, "se": 0.22, "pmid": ""},
+            {"study_id": "DEMO-RA-03", "treatment_a": "infliximab", "treatment_b": "placebo", "effect": 1.08, "se": 0.27, "pmid": ""},
+            {"study_id": "DEMO-RA-04", "treatment_a": "methotrexate", "treatment_b": "placebo", "effect": 0.51, "se": 0.18, "pmid": ""},
+            {"study_id": "DEMO-RA-05", "treatment_a": "adalimumab", "treatment_b": "methotrexate", "effect": 0.83, "se": 0.25, "pmid": ""},
+            {"study_id": "DEMO-RA-06", "treatment_a": "etanercept", "treatment_b": "methotrexate", "effect": 0.74, "se": 0.24, "pmid": ""},
+            {"study_id": "DEMO-RA-07", "treatment_a": "infliximab", "treatment_b": "methotrexate", "effect": 0.57, "se": 0.28, "pmid": ""},
+        ]
+    )
+
+
+def summarize_network(edge_rows: Any, reference: str = "") -> dict[str, Any]:
+    """Create simple NMA planning summaries from extracted log-effect contrasts.
+
+    Effects are interpreted as log odds/risk/hazard ratios where higher values
+    favour ``treatment_a`` over ``treatment_b``. The function pools duplicate
+    direct contrasts by inverse variance and estimates each treatment versus the
+    selected reference by the precision-weighted average of all simple paths.
+    It is a transparent planning approximation, not a replacement for a
+    validated NMA package.
+    """
+
+    import pandas as pd
+
+    required = {"treatment_a", "treatment_b", "effect", "se"}
+    if edge_rows.empty or not required.issubset(edge_rows.columns):
+        return {"reference": reference, "direct": pd.DataFrame(), "relative": pd.DataFrame(), "league": pd.DataFrame(), "narrative": "Enter contrasts with effect and SE values to generate an NMA summary."}
+
+    clean = edge_rows.copy()
+    clean["treatment_a"] = clean["treatment_a"].astype(str).str.strip()
+    clean["treatment_b"] = clean["treatment_b"].astype(str).str.strip()
+    clean["effect"] = pd.to_numeric(clean["effect"], errors="coerce")
+    clean["se"] = pd.to_numeric(clean["se"], errors="coerce")
+    clean = clean[(clean["treatment_a"] != "") & (clean["treatment_b"] != "") & (clean["treatment_a"] != clean["treatment_b"]) & clean["effect"].notna() & clean["se"].gt(0)]
+    if clean.empty:
+        return {"reference": reference, "direct": pd.DataFrame(), "relative": pd.DataFrame(), "league": pd.DataFrame(), "narrative": "No valid contrasts are available yet."}
+
+    direct_rows = []
+    graph: dict[str, dict[str, tuple[float, float]]] = {}
+    for (a, b), group in clean.groupby(["treatment_a", "treatment_b"], sort=True):
+        weights = 1 / (group["se"] ** 2)
+        pooled = float((group["effect"] * weights).sum() / weights.sum())
+        se = float(sqrt(1 / weights.sum()))
+        direct_rows.append({"treatment_a": a, "treatment_b": b, "effect": pooled, "se": se, "studies": int(len(group))})
+        graph.setdefault(a, {})[b] = (pooled, se)
+        graph.setdefault(b, {})[a] = (-pooled, se)
+    direct = pd.DataFrame(direct_rows)
+    treatments = sorted(set(clean["treatment_a"]).union(clean["treatment_b"]))
+    reference = reference if reference in treatments else treatments[0]
+
+    def path_estimates(start: str, end: str) -> list[tuple[float, float]]:
+        estimates: list[tuple[float, float]] = []
+        stack = [(start, [], 0.0, 0.0)]
+        while stack:
+            node, visited, estimate, variance = stack.pop()
+            if node == end and visited:
+                estimates.append((estimate, sqrt(variance)))
+                continue
+            if node in visited:
+                continue
+            for nxt, (edge_effect, edge_se) in graph.get(node, {}).items():
+                if nxt not in visited:
+                    stack.append((nxt, visited + [node], estimate + edge_effect, variance + edge_se**2))
+        return estimates
+
+    rel_rows = []
+    for treatment in treatments:
+        if treatment == reference:
+            rel_rows.append({"treatment": treatment, "effect": 0.0, "se": 0.0, "ci_low": 0.0, "ci_high": 0.0, "ratio": 1.0, "rank_score": 0.5, "paths": 0})
+            continue
+        estimates = path_estimates(treatment, reference)
+        weights = [1 / (se**2) for _, se in estimates if se > 0]
+        if not estimates or not weights:
+            continue
+        effect = sum(est * wt for (est, se), wt in zip(estimates, weights) if se > 0) / sum(weights)
+        se = sqrt(1 / sum(weights))
+        z = effect / se if se else 0.0
+        rank_score = 0.5 * (1 + erf(z / sqrt(2)))
+        rel_rows.append({"treatment": treatment, "effect": effect, "se": se, "ci_low": effect - 1.96 * se, "ci_high": effect + 1.96 * se, "ratio": exp(effect), "rank_score": rank_score, "paths": len(estimates)})
+    relative = pd.DataFrame(rel_rows).sort_values("effect", ascending=False)
+
+    league = pd.DataFrame(index=treatments, columns=treatments, dtype=object)
+    rel_map = {row["treatment"]: row for _, row in relative.iterrows()}
+    for row in treatments:
+        for col in treatments:
+            if row == col:
+                league.loc[row, col] = "—"
+            elif row in rel_map and col in rel_map:
+                diff = rel_map[row]["effect"] - rel_map[col]["effect"]
+                ratio = exp(diff)
+                league.loc[row, col] = f"{ratio:.2f}"
+    best = relative.iloc[0]["treatment"] if not relative.empty else "No treatment"
+    narrative = (
+        f"Using {reference} as the reference, {best} has the largest estimated relative effect in this planning model. "
+        "Interpret these values only after confirming extracted study data, risk of bias, transitivity, heterogeneity, and inconsistency."
+    )
+    return {"reference": reference, "direct": direct, "relative": relative, "league": league.reset_index(names="Treatment"), "narrative": narrative}
+
+
+def dataframe_to_tiff(table: Any, title: str = "Table") -> bytes:
+    """Render a dataframe as a TIFF image for download."""
+
+    display_table = table.copy()
+    try:
+        import matplotlib.pyplot as plt
+
+        fig_height = max(2.0, 0.35 * (len(display_table) + 2))
+        fig_width = max(6.0, 1.4 * len(display_table.columns))
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=200)
+        ax.axis("off")
+        ax.set_title(title, fontsize=12, pad=10)
+        mpl_table = ax.table(cellText=display_table.values, colLabels=display_table.columns, loc="center", cellLoc="center")
+        mpl_table.auto_set_font_size(False)
+        mpl_table.set_fontsize(8)
+        mpl_table.scale(1, 1.25)
+        buffer = BytesIO()
+        fig.savefig(buffer, format="tiff", bbox_inches="tight")
+        plt.close(fig)
+        return buffer.getvalue()
+    except ModuleNotFoundError:
+        from PIL import Image, ImageDraw, ImageFont
+
+        rows = [list(map(str, display_table.columns))] + display_table.astype(str).values.tolist()
+        font = ImageFont.load_default()
+        cell_w = 190
+        cell_h = 28
+        width = max(600, cell_w * max(1, len(display_table.columns)))
+        height = cell_h * (len(rows) + 2)
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+        draw.text((8, 8), title, fill="black", font=font)
+        y = cell_h
+        for row_index, row in enumerate(rows):
+            x = 0
+            fill = "#EEF4FA" if row_index == 0 else "white"
+            for cell in row:
+                draw.rectangle([x, y, x + cell_w, y + cell_h], outline="black", fill=fill)
+                draw.text((x + 5, y + 8), str(cell)[:28], fill="black", font=font)
+                x += cell_w
+            y += cell_h
+        buffer = BytesIO()
+        image.save(buffer, format="TIFF")
+        return buffer.getvalue()
+
+
+def plotly_figure_to_tiff(fig: Any, scale: int = 2) -> bytes:
+    """Convert a Plotly figure to TIFF bytes via Kaleido PNG export and Pillow."""
+
+    from PIL import Image
+
+    png_bytes = fig.to_image(format="png", scale=scale)
+    image = Image.open(BytesIO(png_bytes))
+    output = BytesIO()
+    image.save(output, format="TIFF")
+    return output.getvalue()
 
 
 def generate_protocol_notes(condition: str, interventions: Iterable[str], outcome: str) -> list[str]:

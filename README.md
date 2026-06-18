@@ -11,6 +11,9 @@ A Streamlit web application that helps prepare a network meta-analysis (NMA) by 
 - Provides CSV export of retrieved references for screening.
 - Flags treatment mentions in titles/abstracts as AI-assisted screening cues.
 - Lets reviewers enter verified direct comparisons and visualizes the treatment network.
+- Ships with a runnable rheumatoid arthritis demonstration topic and synthetic extracted contrasts so the web workflow can be explored immediately.
+- Produces an exploratory relative-effect summary, forest plot, league table, and narrative interpretation from entered log-effect estimates and standard errors.
+- Exports the network plot, forest plot, and league table as TIFF (`.tif`) images for manuscript or slide preparation.
 - Generates protocol reminders for transitivity, risk of bias, heterogeneity, inconsistency, and interpretation of treatment rankings.
 
 ## Quick start
@@ -29,7 +32,13 @@ streamlit run app.py
 3. Search PubMed and download the references CSV.
 4. Screen titles/abstracts and full texts using at least two reviewers where appropriate.
 5. Enter only verified direct treatment comparisons into the network editor.
-6. Export extracted study-arm outcome data to a validated NMA package such as `netmeta`, `gemtc`, BUGS/JAGS, or another pre-specified statistical workflow.
+6. Review the exploratory relative-effect table, forest plot, league table, and generated text.
+7. Download TIFF versions of the figures/tables if needed.
+8. Export extracted study-arm outcome data to a validated NMA package such as `netmeta`, `gemtc`, BUGS/JAGS, or another pre-specified statistical workflow.
+
+## Statistical note
+
+The built-in summary pools duplicate direct contrasts with inverse-variance weighting and combines simple network paths to give a transparent planning approximation. It is designed for teaching, protocol development, and data-checking only. Final clinical conclusions should use a validated frequentist or Bayesian NMA implementation with prespecified effect measures, heterogeneity, inconsistency, and risk-of-bias handling.
 
 ## NCBI usage
 
